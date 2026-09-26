@@ -1,240 +1,209 @@
 import os
 import csv
 import sqlite3
-import tempfile
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime
+from io import StringIO, BytesIO
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
+DB_PATH = os.environ.get("DB_PATH", "users.db")
 
-TZ = ZoneInfo("Europe/Moscow")
-DB_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "users.db")
-
-
-# =========================================================
-# DATABASE
-# =========================================================
 
 def db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = db()
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
+            username TEXT,
             first_name TEXT,
             last_name TEXT,
-            username TEXT,
+            phone TEXT,
+            source TEXT,
             first_seen TEXT,
             last_seen TEXT,
-            source TEXT,
-            launches INTEGER DEFAULT 1
+            starts INTEGER DEFAULT 0
         )
     """)
 
     conn.commit()
-    conn.close()
+    return conn
 
-
-def get_user(user_id):
-    conn = db()
-
-    row = conn.execute(
-        "SELECT * FROM users WHERE user_id = ?",
-        (user_id,)
-    ).fetchone()
-
-    conn.close()
-    return row
-
-
-def save_user(user, source, now):
-    old = get_user(user.id)
-    conn = db()
-
-    if old:
-        launches = old["launches"] + 1
-
-        conn.execute("""
-            UPDATE users
-            SET first_name = ?,
-                last_name = ?,
-                username = ?,
-                last_seen = ?,
-                source = ?,
-                launches = ?
-            WHERE user_id = ?
-        """, (
-            user.first_name,
-            user.last_name,
-            user.username,
-            now.isoformat(),
-            source,
-            launches,
-            user.id
-        ))
-
-        is_new = False
-
-    else:
-        launches = 1
-
-        conn.execute("""
-            INSERT INTO users (
-                user_id,
-                first_name,
-                last_name,
-                username,
-                first_seen,
-                last_seen,
-                source,
-                launches
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user.id,
-            user.first_name,
-            user.last_name,
-            user.username,
-            now.isoformat(),
-            now.isoformat(),
-            source,
-            launches
-        ))
-
-        is_new = True
-
-    conn.commit()
-    conn.close()
-
-    return is_new, launches, old
-
-
-# =========================================================
-# HELPERS
-# =========================================================
 
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
 
-def source_name(parameter):
-    sources = {
-        "insta": "📸 Instagram",
-        "instagram": "📸 Instagram",
-        "tg": "✈️ Telegram",
-        "telegram": "✈️ Telegram",
-        "site": "🌐 Сайт",
-        "qr": "🔳 QR",
-    }
-
-    if parameter in sources:
-        return sources[parameter]
-
-    if parameter:
-        return f"🔗 {parameter}"
-
-    return "Telegram / обычный запуск"
+# Постоянная кнопка под строкой ввода
+def persistent_admin_keyboard():
+    return ReplyKeyboardMarkup(
+        [["⚙️ Админ-панель"]],
+        resize_keyboard=True,
+        is_persistent=True
+    )
 
 
-def profile_keyboard(username):
-    if not username:
-        return None
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "👤 Открыть профиль",
-                url=f"https://t.me/{username}"
-            )
-        ]
-    ])
-
-
+# Кнопки внутри админ-панели
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "📊 Статистика",
-                callback_data="admin_stats"
+                callback_data="stats"
             ),
             InlineKeyboardButton(
                 "📅 Сегодня",
-                callback_data="admin_today"
+                callback_data="today"
             ),
         ],
         [
             InlineKeyboardButton(
                 "👥 Пользователи",
-                callback_data="admin_users"
+                callback_data="users"
             ),
             InlineKeyboardButton(
                 "🔎 Поиск",
-                callback_data="admin_search"
+                callback_data="search"
             ),
         ],
         [
             InlineKeyboardButton(
                 "📥 Скачать CSV",
-                callback_data="admin_export"
+                callback_data="csv"
             )
         ],
         [
             InlineKeyboardButton(
                 "🗑 Очистить базу",
-                callback_data="admin_clear"
+                callback_data="clear_confirm"
             ),
             InlineKeyboardButton(
                 "🔄 Обновить",
-                callback_data="admin_home"
-            )
-        ]
+                callback_data="stats"
+            ),
+        ],
     ])
 
 
-def back_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="admin_home"
+def source_name(args):
+
+    if not args:
+        return "Telegram / обычный запуск"
+
+    return f"Telegram / {args[0][:64]}"
+
+
+def save_start(user, source):
+
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    conn = db()
+
+    old = conn.execute(
+        """
+        SELECT starts, first_seen, phone
+        FROM users
+        WHERE user_id=?
+        """,
+        (user.id,)
+    ).fetchone()
+
+    if old:
+
+        conn.execute("""
+            UPDATE users
+            SET username=?,
+                first_name=?,
+                last_name=?,
+                source=?,
+                last_seen=?,
+                starts=?
+            WHERE user_id=?
+        """, (
+            user.username,
+            user.first_name,
+            user.last_name,
+            source,
+            now,
+            old["starts"] + 1,
+            user.id
+        ))
+
+        first = False
+
+    else:
+
+        conn.execute("""
+            INSERT INTO users
+            (
+                user_id,
+                username,
+                first_name,
+                last_name,
+                phone,
+                source,
+                first_seen,
+                last_seen,
+                starts
             )
-        ]
-    ])
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """, (
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+            None,
+            source,
+            now,
+            now
+        ))
+
+        first = True
+
+    conn.commit()
+    conn.close()
+
+    return first, now
 
 
-# =========================================================
-# START
-# =========================================================
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    now = datetime.now(TZ)
 
-    parameter = context.args[0] if context.args else None
-    source = source_name(parameter)
+    source = source_name(context.args)
 
-    is_new, launches, old = save_user(
+    first, now = save_start(
         user,
-        source,
-        now
+        source
     )
+
+    # Админу сразу показываем постоянную кнопку
+    if is_admin(user.id):
+
+        await update.message.reply_text(
+            "Привет! Бот запущен.",
+            reply_markup=persistent_admin_keyboard()
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "Привет! Бот запущен."
+        )
 
     username = (
         f"@{user.username}"
@@ -242,202 +211,82 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else "не указан"
     )
 
-    last_name = user.last_name or "не указана"
-
-    if is_new:
-        title = "🔔 Новый пользователь"
-        status = "🆕 Первый запуск"
-        previous = ""
-
-    else:
-        title = "🔁 Пользователь вернулся"
-        status = f"▶️ Запуск №{launches}"
-        previous = ""
-
-        try:
-            previous_time = datetime.fromisoformat(
-                old["last_seen"]
-            )
-
-            previous = (
-                "\n🕐 Предыдущий запуск: "
-                + previous_time.astimezone(TZ).strftime(
-                    "%d.%m.%Y %H:%M"
-                )
-            )
-
-        except Exception:
-            pass
-
-    notification = (
-        f"{title}\n\n"
-        f"👤 Имя: {user.first_name}\n"
-        f"👤 Фамилия: {last_name}\n"
-        f"🔗 Username: {username}\n"
-        f"🆔 ID: {user.id}\n\n"
-        f"📍 Источник: {source}\n"
-        f"{status}"
-        f"{previous}\n"
-        f"🕐 Сейчас: {now.strftime('%d.%m.%Y %H:%M')}"
+    last_name = (
+        user.last_name
+        or "не указана"
     )
-
-    should_notify = True
-
-    # Не спамим одинаковыми уведомлениями чаще раза в час
-    if not is_new and old:
-        try:
-            previous_time = datetime.fromisoformat(
-                old["last_seen"]
-            )
-
-            if now - previous_time < timedelta(hours=1):
-                should_notify = False
-
-        except Exception:
-            pass
-
-    if should_notify:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=notification,
-            reply_markup=profile_keyboard(user.username)
-        )
-
-    await update.message.reply_text(
-        "Привет! Бот запущен."
-    )
-
-
-# =========================================================
-# STATS
-# =========================================================
-
-def get_stats_text():
-    conn = db()
-
-    total = conn.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
-
-    launches = conn.execute(
-        "SELECT COALESCE(SUM(launches), 0) FROM users"
-    ).fetchone()[0]
-
-    sources = conn.execute("""
-        SELECT source, COUNT(*) AS amount
-        FROM users
-        GROUP BY source
-        ORDER BY amount DESC
-    """).fetchall()
-
-    conn.close()
 
     text = (
-        "📊 Статистика\n\n"
-        f"👥 Уникальных: {total}\n"
-        f"▶️ Всего запусков: {launches}\n\n"
-        f"📍 Источники:"
+        "🔔 Новый запуск бота\n\n"
+
+        f"🆔 ID: {user.id}\n"
+
+        f"👤 Имя: "
+        f"{user.first_name or 'не указано'}\n"
+
+        f"👤 Фамилия: "
+        f"{last_name}\n"
+
+        f"🔗 Username: "
+        f"{username}\n\n"
+
+        f"📍 Источник: "
+        f"{source}\n\n"
+
+        f"{'🆕 Первый запуск' if first else '🔁 Повторный запуск'}\n"
+
+        f"🕐 {now}"
     )
 
-    if sources:
-        for row in sources:
-            text += (
-                f"\n• {row['source']}: "
-                f"{row['amount']}"
-            )
-    else:
-        text += "\nНет данных."
+    # Если /start нажал обычный пользователь —
+    # отправляем уведомление админу
+    if user.id != ADMIN_ID:
 
-    return text
-
-
-def get_today_text():
-    now = datetime.now(TZ)
-
-    start_today = now.replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0
-    )
-
-    conn = db()
-
-    rows = conn.execute(
-        "SELECT last_seen FROM users"
-    ).fetchall()
-
-    conn.close()
-
-    count = 0
-
-    for row in rows:
-        try:
-            seen = datetime.fromisoformat(
-                row["last_seen"]
-            )
-
-            if seen >= start_today:
-                count += 1
-
-        except Exception:
-            pass
-
-    return (
-        "📅 Сегодня\n\n"
-        f"👥 Активных пользователей: {count}\n"
-        f"🕐 Сейчас: {now.strftime('%d.%m.%Y %H:%M')}"
-    )
-
-
-def get_users_text():
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM users
-        ORDER BY last_seen DESC
-        LIMIT 10
-    """).fetchall()
-
-    conn.close()
-
-    if not rows:
-        return "👥 Пользователей пока нет."
-
-    text = "👥 Последние 10 пользователей\n"
-
-    for row in rows:
-
-        username = (
-            f"@{row['username']}"
-            if row["username"]
-            else "без username"
+        await context.bot.send_message(
+            ADMIN_ID,
+            text
         )
 
-        text += (
-            f"\n👤 {row['first_name'] or 'Без имени'}"
-            f" — {username}\n"
-            f"🆔 {row['user_id']}\n"
-            f"▶️ Запусков: {row['launches']}\n"
-            f"📍 {row['source']}\n"
-        )
-
-    return text
-
-
-# =========================================================
-# ADMIN
-# =========================================================
 
 async def admin(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    if not is_admin(update.effective_user.id):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
         return
 
-    context.user_data["waiting_search"] = False
+    context.user_data[
+        "waiting_search"
+    ] = False
+
+    await update.message.reply_text(
+        "⚙️ Админ-панель",
+        reply_markup=persistent_admin_keyboard()
+    )
+
+    await update.message.reply_text(
+        "Выбери нужный раздел:",
+        reply_markup=admin_keyboard()
+    )
+
+
+# Нажатие постоянной кнопки
+async def admin_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    context.user_data[
+        "waiting_search"
+    ] = False
 
     await update.message.reply_text(
         "⚙️ Админ-панель\n\n"
@@ -446,299 +295,315 @@ async def admin(
     )
 
 
-async def stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        return
-
-    await update.message.reply_text(
-        get_stats_text(),
-        reply_markup=admin_keyboard()
-    )
-
-
-# =========================================================
-# SEARCH
-# =========================================================
-
-async def search_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        return
-
-    if not context.user_data.get("waiting_search"):
-        return
-
-    query = update.message.text.strip()
-
-    context.user_data["waiting_search"] = False
+def get_stats():
 
     conn = db()
 
-    if query.startswith("@"):
-        username = query[1:]
+    unique = conn.execute(
+        "SELECT COUNT(*) c FROM users"
+    ).fetchone()["c"]
 
-        row = conn.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE LOWER(username) = LOWER(?)
-            """,
-            (username,)
-        ).fetchone()
-
-    elif query.isdigit():
-
-        row = conn.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE user_id = ?
-            """,
-            (int(query),)
-        ).fetchone()
-
-    else:
-
-        row = conn.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE LOWER(username) = LOWER(?)
-            """,
-            (query,)
-        ).fetchone()
-
-    conn.close()
-
-    if not row:
-        await update.message.reply_text(
-            "❌ Пользователь не найден.",
-            reply_markup=admin_keyboard()
-        )
-        return
-
-    username = (
-        f"@{row['username']}"
-        if row["username"]
-        else "не указан"
-    )
-
-    text = (
-        "🔎 Пользователь найден\n\n"
-        f"👤 Имя: {row['first_name'] or 'не указано'}\n"
-        f"👤 Фамилия: {row['last_name'] or 'не указана'}\n"
-        f"🔗 Username: {username}\n"
-        f"🆔 ID: {row['user_id']}\n\n"
-        f"📍 Источник: {row['source']}\n"
-        f"▶️ Запусков: {row['launches']}\n"
-        f"🟢 Первый запуск:\n{row['first_seen']}\n\n"
-        f"🕐 Последний запуск:\n{row['last_seen']}"
-    )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=profile_keyboard(row["username"])
-    )
-
-    await update.message.reply_text(
-        "⚙️ Админ-панель",
-        reply_markup=admin_keyboard()
-    )
-
-
-# =========================================================
-# CSV EXPORT
-# =========================================================
-
-async def export_csv(context):
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
+    starts = conn.execute(
+        """
+        SELECT COALESCE(
+            SUM(starts), 0
+        ) c
         FROM users
-        ORDER BY last_seen DESC
+        """
+    ).fetchone()["c"]
+
+    sources = conn.execute("""
+        SELECT source, COUNT(*) c
+        FROM users
+        GROUP BY source
+        ORDER BY c DESC
     """).fetchall()
 
     conn.close()
 
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".csv",
-        delete=False,
-        encoding="utf-8-sig",
-        newline=""
-    ) as file:
-
-        writer = csv.writer(
-            file,
-            delimiter=";"
-        )
-
-        writer.writerow([
-            "Telegram ID",
-            "Имя",
-            "Фамилия",
-            "Username",
-            "Первый запуск",
-            "Последний запуск",
-            "Источник",
-            "Запусков"
-        ])
-
-        for row in rows:
-            writer.writerow([
-                row["user_id"],
-                row["first_name"] or "",
-                row["last_name"] or "",
-                row["username"] or "",
-                row["first_seen"],
-                row["last_seen"],
-                row["source"],
-                row["launches"]
-            ])
-
-        filename = file.name
-
-    try:
-
-        with open(filename, "rb") as export_file:
-
-            await context.bot.send_document(
-                chat_id=ADMIN_ID,
-                document=export_file,
-                filename="telegram_users.csv",
-                caption=(
-                    "📥 База пользователей\n\n"
-                    f"👥 Записей: {len(rows)}\n"
-                    f"🕐 {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}"
-                )
-            )
-
-    finally:
-
-        try:
-            os.remove(filename)
-        except Exception:
-            pass
+    return unique, starts, sources
 
 
-# =========================================================
-# BUTTONS
-# =========================================================
-
-async def admin_buttons(
+async def stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    query = update.callback_query
 
-    if not is_admin(query.from_user.id):
-        await query.answer("Нет доступа.")
+    if not is_admin(
+        update.effective_user.id
+    ):
         return
 
-    await query.answer()
+    unique, starts, sources = get_stats()
 
-    # HOME
-    if query.data == "admin_home":
+    src = "\n".join(
+        f"• {r['source']}: {r['c']}"
+        for r in sources
+    )
 
-        context.user_data["waiting_search"] = False
+    if not src:
+        src = "• нет данных"
 
-        await query.edit_message_text(
-            "⚙️ Админ-панель\n\n"
-            "Выбери нужный раздел:",
+    text = (
+        "📊 Статистика\n\n"
+
+        f"👥 Уникальных: "
+        f"{unique}\n"
+
+        f"▶️ Всего запусков: "
+        f"{starts}\n\n"
+
+        f"📍 Источники:\n"
+        f"{src}"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+
+async def callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    q = update.callback_query
+
+    if not is_admin(q.from_user.id):
+
+        await q.answer()
+        return
+
+    await q.answer()
+
+    # СТАТИСТИКА
+    if q.data == "stats":
+
+        unique, starts, sources = get_stats()
+
+        src = "\n".join(
+            f"• {r['source']}: {r['c']}"
+            for r in sources
+        )
+
+        if not src:
+            src = "• нет данных"
+
+        await q.message.reply_text(
+            "📊 Статистика\n\n"
+
+            f"👥 Уникальных: "
+            f"{unique}\n"
+
+            f"▶️ Всего запусков: "
+            f"{starts}\n\n"
+
+            f"📍 Источники:\n"
+            f"{src}",
+
             reply_markup=admin_keyboard()
         )
 
-        return
+    # СЕГОДНЯ
+    elif q.data == "today":
 
-    # STATS
-    if query.data == "admin_stats":
+        today = datetime.now().strftime(
+            "%d.%m.%Y"
+        )
 
-        await query.edit_message_text(
-            get_stats_text(),
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE last_seen LIKE ?
+            ORDER BY last_seen DESC
+            """,
+            (today + "%",)
+        ).fetchall()
+
+        conn.close()
+
+        text = (
+            f"📅 Сегодня\n\n"
+            f"👥 Пользователей: "
+            f"{len(rows)}"
+        )
+
+        if rows:
+
+            text += "\n\n"
+
+            text += "\n".join(
+
+                (
+                    f"• {r['user_id']} — "
+                    f"@{r['username']}"
+                )
+
+                if r["username"]
+
+                else
+
+                (
+                    f"• {r['user_id']} — "
+                    f"{r['first_name'] or 'без имени'}"
+                )
+
+                for r in rows[:30]
+            )
+
+        await q.message.reply_text(
+            text,
             reply_markup=admin_keyboard()
         )
 
-        return
+    # ПОЛЬЗОВАТЕЛИ
+    elif q.data == "users":
 
-    # TODAY
-    if query.data == "admin_today":
+        conn = db()
 
-        await query.edit_message_text(
-            get_today_text(),
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM users
+            ORDER BY last_seen DESC
+            LIMIT 50
+            """
+        ).fetchall()
+
+        conn.close()
+
+        if not rows:
+
+            text = (
+                "👥 База пока пустая."
+            )
+
+        else:
+
+            parts = [
+                "👥 Пользователи\n"
+            ]
+
+            for r in rows:
+
+                username = (
+                    f"@{r['username']}"
+                    if r["username"]
+                    else "без username"
+                )
+
+                phone = (
+                    r["phone"]
+                    or "телефон не предоставлен"
+                )
+
+                parts.append(
+                    f"\n🆔 {r['user_id']}\n"
+                    f"👤 {r['first_name'] or '—'}\n"
+                    f"🔗 {username}\n"
+                    f"📱 {phone}\n"
+                    f"▶️ Запусков: {r['starts']}\n"
+                )
+
+            text = "\n".join(parts)
+
+        await q.message.reply_text(
+            text[:4000],
             reply_markup=admin_keyboard()
         )
 
-        return
+    # ПОИСК
+    elif q.data == "search":
 
-    # USERS
-    if query.data == "admin_users":
+        context.user_data[
+            "waiting_search"
+        ] = True
 
-        await query.edit_message_text(
-            get_users_text(),
-            reply_markup=admin_keyboard()
-        )
-
-        return
-
-    # SEARCH
-    if query.data == "admin_search":
-
-        context.user_data["waiting_search"] = True
-
-        await query.edit_message_text(
-            "🔎 Поиск пользователя\n\n"
-            "Отправь мне:\n\n"
+        await q.message.reply_text(
+            "🔎 Отправь:\n\n"
             "• Telegram ID\n"
-            "или\n"
-            "• @username\n\n"
-            "Например:\n"
-            "7614332268",
-            reply_markup=back_keyboard()
+            "• username\n"
+            "• или имя пользователя"
         )
 
-        return
+    # CSV
+    elif q.data == "csv":
 
-    # EXPORT
-    if query.data == "admin_export":
+        conn = db()
 
-        await export_csv(context)
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM users
+            ORDER BY first_seen
+            """
+        ).fetchall()
 
-        return
+        conn.close()
 
-    # CLEAR DATABASE
-    if query.data == "admin_clear":
+        s = StringIO()
 
-        keyboard = InlineKeyboardMarkup([
+        writer = csv.writer(s)
+
+        writer.writerow([
+            "user_id",
+            "username",
+            "first_name",
+            "last_name",
+            "phone",
+            "source",
+            "first_seen",
+            "last_seen",
+            "starts"
+        ])
+
+        for r in rows:
+
+            writer.writerow(
+                [r[k] for k in r.keys()]
+            )
+
+        data = BytesIO(
+            s.getvalue().encode(
+                "utf-8-sig"
+            )
+        )
+
+        data.name = "users.csv"
+
+        await q.message.reply_document(
+            data,
+            caption="📥 База пользователей"
+        )
+
+    # ПОДТВЕРЖДЕНИЕ ОЧИСТКИ
+    elif q.data == "clear_confirm":
+
+        kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "❌ Отмена",
-                    callback_data="admin_home"
+                    callback_data="stats"
                 ),
+
                 InlineKeyboardButton(
-                    "🗑 Да, удалить",
-                    callback_data="admin_clear_confirm"
-                )
+                    "🗑 Да, очистить",
+                    callback_data="clear_yes"
+                ),
             ]
         ])
 
-        await query.edit_message_text(
-            "⚠️ Очистить базу?\n\n"
-            "Будут удалены все сохранённые "
-            "пользователи и статистика.\n\n"
-            "Это действие нельзя отменить.",
-            reply_markup=keyboard
+        await q.message.reply_text(
+            "⚠️ Удалить всю статистику пользователей?",
+            reply_markup=kb
         )
 
-        return
-
-    # CLEAR CONFIRM
-    if query.data == "admin_clear_confirm":
+    # ОЧИСТКА
+    elif q.data == "clear_yes":
 
         conn = db()
 
@@ -749,70 +614,194 @@ async def admin_buttons(
         conn.commit()
         conn.close()
 
-        await query.edit_message_text(
-            "🗑 База очищена.\n\n"
-            "Статистика начинается заново.",
+        await q.message.reply_text(
+            "🗑 База очищена.",
+            reply_markup=admin_keyboard()
+        )
+
+
+async def search_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return
+
+    if not context.user_data.get(
+        "waiting_search"
+    ):
+        return
+
+    context.user_data[
+        "waiting_search"
+    ] = False
+
+    query = (
+        update.message.text
+        .strip()
+        .lstrip("@")
+    )
+
+    conn = db()
+
+    if query.isdigit():
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE user_id=?
+            """,
+            (int(query),)
+        ).fetchone()
+
+    else:
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM users
+
+            WHERE
+            LOWER(
+                COALESCE(username,'')
+            ) = LOWER(?)
+
+            OR
+
+            LOWER(
+                COALESCE(first_name,'')
+            ) LIKE LOWER(?)
+
+            LIMIT 1
+            """,
+
+            (
+                query,
+                f"%{query}%"
+            )
+        ).fetchone()
+
+    conn.close()
+
+    if not row:
+
+        await update.message.reply_text(
+            "❌ Ничего не найдено.",
             reply_markup=admin_keyboard()
         )
 
         return
 
+    username = (
+        f"@{row['username']}"
+        if row["username"]
+        else "не указан"
+    )
 
-# =========================================================
-# MAIN
-# =========================================================
+    phone = (
+        row["phone"]
+        or "не предоставлен"
+    )
+
+    await update.message.reply_text(
+
+        "🔎 Пользователь\n\n"
+
+        f"🆔 ID: "
+        f"{row['user_id']}\n"
+
+        f"👤 Имя: "
+        f"{row['first_name'] or 'не указано'}\n"
+
+        f"👤 Фамилия: "
+        f"{row['last_name'] or 'не указана'}\n"
+
+        f"🔗 Username: "
+        f"{username}\n"
+
+        f"📱 Телефон: "
+        f"{phone}\n\n"
+
+        f"📍 Источник: "
+        f"{row['source']}\n"
+
+        f"🆕 Первый запуск: "
+        f"{row['first_seen']}\n"
+
+        f"🕐 Последний запуск: "
+        f"{row['last_seen']}\n"
+
+        f"▶️ Запусков: "
+        f"{row['starts']}",
+
+        reply_markup=admin_keyboard()
+    )
+
 
 def main():
 
-    init_db()
+    db().close()
 
-    application = (
+    app = (
         Application
         .builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "admin",
             admin
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "stats",
-            stats
+            stats_command
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CallbackQueryHandler(
-            admin_buttons,
-            pattern="^admin_"
+            callback
         )
     )
 
-    application.add_handler(
+    # Постоянная кнопка админки
+    app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.Regex(
+                r"^⚙️ Админ-панель$"
+            ),
+            admin_button
+        )
+    )
+
+    # Поиск
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
             search_message
         )
     )
 
-    print("AKF18 BOT v3.0 STARTED")
+    print("Bot started")
 
-    application.run_polling(
-        drop_pending_updates=True
-    )
+    app.run_polling()
 
 
 if __name__ == "__main__":
